@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
 from datetime import date
@@ -46,18 +47,49 @@ DATA_DIR = Path(_setting("decidon_data_dir", str(APP_DIR / "data")))
 
 # ----------------------------------------------------------------------------- données
 
+def _download_failed(url: str, label: str, reason: str) -> None:
+    st.error(f"**Impossible de télécharger `{label}`** — {reason}\n\nAdresse essayée :\n```\n{url}\n```")
+    st.markdown(
+        "Points à vérifier :\n"
+        "1. **Secret `pages_url`** (*Manage app → Settings → Secrets*) : l'adresse doit être celle du fichier "
+        "dans la release, sans `VOTRE-COMPTE`, avec le bon nom de compte ou d'organisation.\n"
+        "2. **Dépôt public** : *Settings → General → Danger Zone → Change visibility*. "
+        "Un dépôt privé renvoie 404.\n"
+        "3. **Release publiée**, pas en brouillon (*Draft*), et envoi du fichier terminé.\n"
+        "4. **Nom du fichier** dans la release : exactement `pages.parquet`.\n\n"
+        "Astuce : collez l'adresse dans une fenêtre de navigation privée. Elle doit lancer un téléchargement."
+    )
+    st.stop()
+
+
 def _download(url: str, dest: Path, label: str) -> None:
+    url = url.strip().strip('"').strip("'")
+    if "VOTRE-COMPTE" in url:
+        _download_failed(url, label, "l'adresse contient encore `VOTRE-COMPTE` ; remplacez-le par votre nom GitHub.")
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
     bar = st.progress(0.0, text=f"Téléchargement de {label}…")
-    with urllib.request.urlopen(url) as r, open(tmp, "wb") as f:
-        total = int(r.headers.get("Content-Length") or 0)
-        done = 0
-        while chunk := r.read(1 << 20):
-            f.write(chunk)
-            done += len(chunk)
-            if total:
-                bar.progress(min(done / total, 1.0), text=f"Téléchargement de {label} : {done / 1e6:.0f}/{total / 1e6:.0f} Mo")
+    req = urllib.request.Request(url, headers={"User-Agent": "decidon-viewer"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
+            done = 0
+            while chunk := r.read(1 << 20):
+                f.write(chunk)
+                done += len(chunk)
+                if total:
+                    bar.progress(min(done / total, 1.0),
+                                 text=f"Téléchargement de {label} : {done / 1e6:.0f}/{total / 1e6:.0f} Mo")
+    except urllib.error.HTTPError as e:
+        tmp.unlink(missing_ok=True)
+        bar.empty()
+        why = {404: "erreur 404 : fichier introuvable à cette adresse",
+               403: "erreur 403 : accès refusé (dépôt privé ou limite GitHub)"}.get(e.code, f"erreur HTTP {e.code}")
+        _download_failed(url, label, why + ".")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        tmp.unlink(missing_ok=True)
+        bar.empty()
+        _download_failed(url, label, f"problème réseau ({e}). Réessayez avec *Manage app → Reboot app*.")
     tmp.rename(dest)
     bar.empty()
 
@@ -95,9 +127,10 @@ def db() -> duckdb.DuckDBPyConnection:
 
 @st.cache_data(show_spinner=False, max_entries=64)
 def load_pages(path: str, doc_id: str) -> pd.DataFrame:
-    return db().execute(
+    df = db().execute(
         "SELECT * FROM read_parquet(?) WHERE doc_id = ? ORDER BY page_num", [path, doc_id]
     ).df()
+    return df.astype(object).where(df.notna(), None)  # valeurs absentes → None
 
 
 @st.cache_data(show_spinner="Recherche dans le corpus…", max_entries=32)
@@ -177,7 +210,15 @@ if index_path is None:
     st.stop()
 
 idx = load_index(str(index_path))
-docs_by_id = {r["doc_id"]: r for r in idx.to_dict("records")}
+def _none_if_missing(v):
+    """pandas ≥ 3 renvoie NaN (et non None) pour une chaîne absente : on uniformise en None."""
+    try:
+        return None if v is None or pd.isna(v) else v
+    except (TypeError, ValueError):  # listes, tableaux…
+        return v
+
+
+docs_by_id = {r["doc_id"]: {k: _none_if_missing(v) for k, v in r.items()} for r in idx.to_dict("records")}
 
 ss = st.session_state
 qp = st.query_params
